@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  @apply min-h-screen bg-gradient-to-br from-sky-200 via-purple-200 to-pink-200 font-sans text-slate-800;
+}
+
+.glass {
+  @apply bg-glass/80 backdrop-blur-xl border border-glassBorder shadow-glow;
+}
+
+.gradient-border {
+  border-image: linear-gradient(135deg, rgba(59, 130, 246, 0.6), rgba(236, 72, 153, 0.6)) 1;
+}
