@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import {
@@ -10,6 +10,8 @@ import {
   Legend,
   Line,
   LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Scatter,
   ScatterChart,
@@ -33,13 +35,16 @@ type AnalysisResult = {
   totalRows: number;
   totalColumns: number;
   hasNulls: boolean;
-  orderedByFirstColumn: boolean;
+  orderedByAnyColumn: boolean;
   totalPositiveValues: number;
   columnsWithNulls: number;
   columnStats: ColumnStats[];
   numericColumns: string[];
   dateColumns: string[];
+  textColumns: string[];
   rawRows: DataRow[];
+  columns: string[];
+  orderedColumns: Array<{ name: string; order: ColumnStats["ordered"] }>;
 };
 
 type HistogramBin = {
@@ -72,17 +77,20 @@ const isNullValue = (value: string | number | null) => {
   return String(value).trim() === "";
 };
 
-const detectOrder = (values: Array<string | number>) => {
+const detectOrder = (
+  values: Array<string | number>,
+  compare: (a: string | number, b: string | number) => number
+) => {
   if (values.length < 2) {
     return "sin orden" as const;
   }
   let ascending = true;
   let descending = true;
   for (let index = 1; index < values.length; index += 1) {
-    if (values[index] < values[index - 1]) {
+    if (compare(values[index], values[index - 1]) < 0) {
       ascending = false;
     }
-    if (values[index] > values[index - 1]) {
+    if (compare(values[index], values[index - 1]) > 0) {
       descending = false;
     }
   }
@@ -148,6 +156,73 @@ const calculateCorrelation = (xValues: number[], yValues: number[]) => {
 
 const formatBoolean = (value: boolean) => (value ? "Sí" : "No");
 
+const downloadBlob = (blob: Blob, fileName: string) => {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(url);
+};
+
+const svgToPngDataUrl = async (svgElement: SVGSVGElement) => {
+  const serialized = new XMLSerializer().serializeToString(svgElement);
+  const svgBlob = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+  const url = URL.createObjectURL(svgBlob);
+  const image = new Image();
+  image.src = url;
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("No se pudo convertir el gráfico."));
+  });
+  const scale = window.devicePixelRatio || 1;
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width * scale;
+  canvas.height = image.height * scale;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    URL.revokeObjectURL(url);
+    throw new Error("No se pudo generar la imagen del gráfico.");
+  }
+  context.scale(scale, scale);
+  context.drawImage(image, 0, 0);
+  URL.revokeObjectURL(url);
+  return canvas.toDataURL("image/png");
+};
+
+const downloadChartAsPng = async (chartId: string, title: string) => {
+  const container = document.querySelector(`[data-chart-id="${chartId}"]`);
+  const svg = container?.querySelector("svg");
+  if (!svg) {
+    throw new Error("No se encontró el gráfico para descargar.");
+  }
+  const dataUrl = await svgToPngDataUrl(svg);
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  downloadBlob(blob, `${title}.png`);
+};
+
+const downloadChartAsExcel = async (chartId: string, title: string) => {
+  const container = document.querySelector(`[data-chart-id="${chartId}"]`);
+  const svg = container?.querySelector("svg");
+  if (!svg) {
+    throw new Error("No se encontró el gráfico para descargar.");
+  }
+  const pngDataUrl = await svgToPngDataUrl(svg);
+  const htmlContent = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    <h3>${title}</h3>
+    <img src="${pngDataUrl}" alt="${title}" />
+  </body>
+</html>`;
+  const blob = new Blob([htmlContent], { type: "application/vnd.ms-excel" });
+  downloadBlob(blob, `${title}.xls`);
+};
+
 export default function HomePage() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
@@ -156,6 +231,18 @@ export default function HomePage() {
   const [isDragging, setIsDragging] = useState(false);
   const [expandedColumns, setExpandedColumns] = useState<Set<string>>(new Set());
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [sortColumn, setSortColumn] = useState<string | null>(null);
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+  const [histogramColumn, setHistogramColumn] = useState<string | null>(null);
+  const [pieColumn, setPieColumn] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (analysis) {
+      setSortColumn(analysis.columns[0] ?? null);
+      setHistogramColumn(analysis.numericColumns[0] ?? null);
+      setPieColumn(analysis.textColumns[0] ?? null);
+    }
+  }, [analysis]);
 
   const resetState = () => {
     setFileName(null);
@@ -240,6 +327,26 @@ export default function HomePage() {
     });
   }, [analysis]);
 
+  const pieData = useMemo(() => {
+    if (!analysis || !pieColumn) return [];
+    const counts = new Map<string, number>();
+    analysis.rawRows.forEach((row) => {
+      const value = row[pieColumn];
+      if (isNullValue(value)) {
+        return;
+      }
+      const key = String(value).trim();
+      if (!key) {
+        return;
+      }
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    });
+    return Array.from(counts.entries())
+      .map(([label, value]) => ({ label, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 8);
+  }, [analysis, pieColumn]);
+
   const correlationMatrix = useMemo(() => {
     if (!analysis) return [];
     const columns = analysis.numericColumns;
@@ -305,6 +412,127 @@ export default function HomePage() {
     }
     return pairs;
   }, [analysis]);
+
+  const sortedRows = useMemo(() => {
+    if (!analysis || !sortColumn) {
+      return [];
+    }
+    const columnMeta = analysis.columnStats.find((column) => column.name === sortColumn);
+    const directionMultiplier = sortDirection === "asc" ? 1 : -1;
+    const rowsCopy = [...analysis.rawRows];
+    rowsCopy.sort((a, b) => {
+      const aValue = a[sortColumn];
+      const bValue = b[sortColumn];
+      if (isNullValue(aValue) && isNullValue(bValue)) {
+        return 0;
+      }
+      if (isNullValue(aValue)) {
+        return 1;
+      }
+      if (isNullValue(bValue)) {
+        return -1;
+      }
+      if (columnMeta?.dataType === "numérico") {
+        const aNumber = toNumber(aValue) ?? 0;
+        const bNumber = toNumber(bValue) ?? 0;
+        return (aNumber - bNumber) * directionMultiplier;
+      }
+      const aText = String(aValue).toLocaleLowerCase();
+      const bText = String(bValue).toLocaleLowerCase();
+      return aText.localeCompare(bText, "es", { numeric: true }) * directionMultiplier;
+    });
+    return rowsCopy;
+  }, [analysis, sortColumn, sortDirection]);
+
+  const handleDownloadSorted = (format: "csv" | "xlsx") => {
+    if (!analysis || !sortColumn) {
+      setErrorMessage("Selecciona una columna para ordenar antes de descargar.");
+      return;
+    }
+    const fileBaseName = fileName ? fileName.split(".")[0] : "dataset";
+    if (format === "csv") {
+      const csv = Papa.unparse(sortedRows as Record<string, string | number | null>[]);
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      downloadBlob(blob, `${fileBaseName}-ordenado.csv`);
+      return;
+    }
+    const worksheet = XLSX.utils.json_to_sheet(sortedRows as Record<string, string | number | null>[]);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Ordenado");
+    const excelBuffer = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+    const blob = new Blob([excelBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    downloadBlob(blob, `${fileBaseName}-ordenado.xlsx`);
+  };
+
+  const handleDownloadBundle = async () => {
+    if (!analysis || !sortColumn) {
+      setErrorMessage("Selecciona una columna para ordenar antes de descargar el paquete.");
+      return;
+    }
+    if (!histogramColumn || !pieColumn) {
+      setErrorMessage("Selecciona una columna numérica y una columna de texto para los gráficos.");
+      return;
+    }
+    try {
+      const fileBaseName = fileName ? fileName.split(".")[0] : "dataset";
+      const histogramSvg = document.querySelector(
+        `[data-chart-id="hist-${histogramColumn}"] svg`
+      ) as SVGSVGElement | null;
+      const pieSvg = document.querySelector(`[data-chart-id="pie-${pieColumn}"] svg`) as SVGSVGElement | null;
+      if (!histogramSvg || !pieSvg) {
+        throw new Error("No se encontraron los gráficos para incluir en el paquete.");
+      }
+      const histogramImage = await svgToPngDataUrl(histogramSvg);
+      const pieImage = await svgToPngDataUrl(pieSvg);
+      const headers = analysis.columns;
+      const tableRows = sortedRows
+        .map(
+          (row) =>
+            `<tr>${headers
+              .map((header) => `<td>${row[header] ?? ""}</td>`)
+              .join("")}</tr>`
+        )
+        .join("");
+      const htmlContent = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      table { border-collapse: collapse; font-size: 12px; }
+      th, td { border: 1px solid #ccc; padding: 4px 6px; }
+      img { max-width: 600px; }
+    </style>
+  </head>
+  <body>
+    <h3>Dataset ordenado</h3>
+    <table>
+      <thead>
+        <tr>${headers.map((header) => `<th>${header}</th>`).join("")}</tr>
+      </thead>
+      <tbody>
+        ${tableRows}
+      </tbody>
+    </table>
+    <h3>Histograma · ${histogramColumn}</h3>
+    <img src="${histogramImage}" alt="Histograma" />
+    <h3>Gráfico de torta · ${pieColumn}</h3>
+    <img src="${pieImage}" alt="Gráfico de torta" />
+  </body>
+</html>`;
+      const blob = new Blob([htmlContent], { type: "application/vnd.ms-excel" });
+      downloadBlob(blob, `${fileBaseName}-ordenado-con-graficos.xls`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "No se pudo descargar el paquete.");
+    }
+  };
+
+  const handleChartDownload = async (action: () => Promise<void>) => {
+    try {
+      await action();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "No se pudo descargar el gráfico.");
+    }
+  };
 
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
@@ -437,7 +665,7 @@ export default function HomePage() {
                   { label: "Total de Columnas", value: analysis.totalColumns },
                   { label: "Columnas con Nulos", value: analysis.columnsWithNulls },
                   { label: "Valores Positivos", value: analysis.totalPositiveValues },
-                  { label: "Dataset Ordenado", value: formatBoolean(analysis.orderedByFirstColumn) }
+                  { label: "Dataset Ordenado", value: formatBoolean(analysis.orderedByAnyColumn) }
                 ].map((card) => (
                   <div key={card.label} className="glass rounded-3xl p-5">
                     <p className="text-xs uppercase tracking-wide text-slate-500">{card.label}</p>
@@ -453,6 +681,90 @@ export default function HomePage() {
                 <span className="rounded-full bg-white/70 px-3 py-1">
                   Columnas tipo fecha: {analysis.dateColumns.length}
                 </span>
+                {analysis.orderedColumns.length > 0 ? (
+                  <span className="rounded-full bg-white/70 px-3 py-1">
+                    Orden detectado: {analysis.orderedColumns.map((column) => `${column.name} (${column.order})`).join(", ")}
+                  </span>
+                ) : (
+                  <span className="rounded-full bg-white/70 px-3 py-1">Sin columnas ordenadas</span>
+                )}
+              </div>
+              <div className="mt-6 grid gap-4 rounded-3xl border border-white/60 bg-white/60 p-5 md:grid-cols-[2fr_1fr_1fr]">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Descargar archivo ordenado</p>
+                  <div className="mt-2 flex flex-col gap-3 text-sm sm:flex-row sm:items-center">
+                    <select
+                      className="rounded-full border border-white/80 bg-white/70 px-4 py-2 text-sm"
+                      value={sortColumn ?? ""}
+                      onChange={(event) => setSortColumn(event.target.value)}
+                    >
+                      {analysis.columns.map((column) => (
+                        <option key={column} value={column}>
+                          {column}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      className="rounded-full border border-white/80 bg-white/70 px-4 py-2 text-sm"
+                      value={sortDirection}
+                      onChange={(event) => setSortDirection(event.target.value as "asc" | "desc")}
+                    >
+                      <option value="asc">Ascendente</option>
+                      <option value="desc">Descendente</option>
+                    </select>
+                  </div>
+                </div>
+                <button
+                  className="rounded-full border border-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-900 transition hover:bg-slate-900 hover:text-white"
+                  type="button"
+                  onClick={() => handleDownloadSorted("csv")}
+                >
+                  Descargar CSV
+                </button>
+                <button
+                  className="rounded-full border border-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-900 transition hover:bg-slate-900 hover:text-white"
+                  type="button"
+                  onClick={() => handleDownloadSorted("xlsx")}
+                >
+                  Descargar Excel
+                </button>
+              </div>
+              <div className="mt-4 grid gap-3 rounded-3xl border border-white/60 bg-white/60 p-5 md:grid-cols-[2fr_2fr_1fr]">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Histograma (numérico)</p>
+                  <select
+                    className="mt-2 w-full rounded-full border border-white/80 bg-white/70 px-4 py-2 text-sm"
+                    value={histogramColumn ?? ""}
+                    onChange={(event) => setHistogramColumn(event.target.value)}
+                  >
+                    {analysis.numericColumns.map((column) => (
+                      <option key={column} value={column}>
+                        {column}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Gráfico de torta (texto)</p>
+                  <select
+                    className="mt-2 w-full rounded-full border border-white/80 bg-white/70 px-4 py-2 text-sm"
+                    value={pieColumn ?? ""}
+                    onChange={(event) => setPieColumn(event.target.value)}
+                  >
+                    {analysis.textColumns.map((column) => (
+                      <option key={column} value={column}>
+                        {column}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  className="rounded-full border border-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-900 transition hover:bg-slate-900 hover:text-white"
+                  type="button"
+                  onClick={() => void handleDownloadBundle()}
+                >
+                  Descargar paquete
+                </button>
               </div>
             </section>
 
@@ -507,31 +819,75 @@ export default function HomePage() {
               <div className="mt-6 grid gap-6 lg:grid-cols-2">
                 <div className="glass rounded-3xl p-5">
                   <h3 className="text-sm font-semibold">Nulos por columna</h3>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsPng("null-bars", "nulos-por-columna"))
+                      }
+                    >
+                      PNG
+                    </button>
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsExcel("null-bars", "nulos-por-columna"))
+                      }
+                    >
+                      Excel
+                    </button>
+                  </div>
                   <div className="mt-4 h-64">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={nullBarData} margin={{ left: -10 }}>
-                        <CartesianGrid strokeDasharray="3 3" />
-                        <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-20} height={50} />
-                        <YAxis />
-                        <Tooltip />
-                        <Bar dataKey="nulos" fill="#a855f7" radius={[8, 8, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
+                    <div data-chart-id="null-bars" className="h-full w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={nullBarData} margin={{ left: -10 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-20} height={50} />
+                          <YAxis />
+                          <Tooltip />
+                          <Bar dataKey="nulos" fill="#a855f7" radius={[8, 8, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
                   </div>
                 </div>
 
                 <div className="glass rounded-3xl p-5">
                   <h3 className="text-sm font-semibold">Valores positivos por columna</h3>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsPng("positive-bars", "positivos-por-columna"))
+                      }
+                    >
+                      PNG
+                    </button>
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsExcel("positive-bars", "positivos-por-columna"))
+                      }
+                    >
+                      Excel
+                    </button>
+                  </div>
                   <div className="mt-4 h-64">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={positiveBarData} margin={{ left: -10 }}>
-                        <CartesianGrid strokeDasharray="3 3" />
-                        <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-20} height={50} />
-                        <YAxis />
-                        <Tooltip />
-                        <Bar dataKey="positivos" fill="#38bdf8" radius={[8, 8, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
+                    <div data-chart-id="positive-bars" className="h-full w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={positiveBarData} margin={{ left: -10 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0} angle={-20} height={50} />
+                          <YAxis />
+                          <Tooltip />
+                          <Bar dataKey="positivos" fill="#38bdf8" radius={[8, 8, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -541,19 +897,89 @@ export default function HomePage() {
                   {histograms.map((histogram) => (
                     <div key={histogram.column} className="glass rounded-3xl p-5">
                       <h3 className="text-sm font-semibold">Histograma · {histogram.column}</h3>
+                      <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                        <button
+                          className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                          type="button"
+                          onClick={() =>
+                            void handleChartDownload(() =>
+                              downloadChartAsPng(`hist-${histogram.column}`, `histograma-${histogram.column}`)
+                            )
+                          }
+                        >
+                          PNG
+                        </button>
+                        <button
+                          className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                          type="button"
+                          onClick={() =>
+                            void handleChartDownload(() =>
+                              downloadChartAsExcel(`hist-${histogram.column}`, `histograma-${histogram.column}`)
+                            )
+                          }
+                        >
+                          Excel
+                        </button>
+                      </div>
                       <div className="mt-4 h-60">
-                        <ResponsiveContainer width="100%" height="100%">
-                          <BarChart data={histogram.bins}>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis dataKey="bin" tick={{ fontSize: 10 }} interval={0} angle={-20} height={60} />
-                            <YAxis />
-                            <Tooltip />
-                            <Bar dataKey="count" fill="#fb7185" radius={[8, 8, 0, 0]} />
-                          </BarChart>
-                        </ResponsiveContainer>
+                        <div data-chart-id={`hist-${histogram.column}`} className="h-full w-full">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={histogram.bins}>
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis dataKey="bin" tick={{ fontSize: 10 }} interval={0} angle={-20} height={60} />
+                              <YAxis />
+                              <Tooltip />
+                              <Bar dataKey="count" fill="#fb7185" radius={[8, 8, 0, 0]} />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
                       </div>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {analysis.textColumns.length > 0 && pieColumn && (
+                <div className="mt-6 glass rounded-3xl p-5">
+                  <h3 className="text-sm font-semibold">Gráfico de torta · {pieColumn}</h3>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsPng(`pie-${pieColumn}`, `torta-${pieColumn}`))
+                      }
+                    >
+                      PNG
+                    </button>
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsExcel(`pie-${pieColumn}`, `torta-${pieColumn}`))
+                      }
+                    >
+                      Excel
+                    </button>
+                  </div>
+                  <div className="mt-4 h-64">
+                    <div data-chart-id={`pie-${pieColumn}`} className="h-full w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <PieChart>
+                          <Tooltip />
+                          <Legend />
+                          <Pie
+                            data={pieData}
+                            dataKey="value"
+                            nameKey="label"
+                            outerRadius={90}
+                            fill="#f97316"
+                            label
+                          />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -622,16 +1048,42 @@ export default function HomePage() {
                       <h3 className="text-sm font-semibold">
                         Dispersión · {pair.x} vs {pair.y}
                       </h3>
+                      <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                        <button
+                          className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                          type="button"
+                          onClick={() =>
+                            void handleChartDownload(() =>
+                              downloadChartAsPng(`scatter-${pair.x}-${pair.y}`, `dispersion-${pair.x}-${pair.y}`)
+                            )
+                          }
+                        >
+                          PNG
+                        </button>
+                        <button
+                          className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                          type="button"
+                          onClick={() =>
+                            void handleChartDownload(() =>
+                              downloadChartAsExcel(`scatter-${pair.x}-${pair.y}`, `dispersion-${pair.x}-${pair.y}`)
+                            )
+                          }
+                        >
+                          Excel
+                        </button>
+                      </div>
                       <div className="mt-4 h-60">
-                        <ResponsiveContainer width="100%" height="100%">
-                          <ScatterChart>
-                            <CartesianGrid strokeDasharray="3 3" />
-                            <XAxis type="number" dataKey="x" name={pair.x} />
-                            <YAxis type="number" dataKey="y" name={pair.y} />
-                            <Tooltip cursor={{ strokeDasharray: "3 3" }} />
-                            <Scatter data={pair.points} fill="#0ea5e9" />
-                          </ScatterChart>
-                        </ResponsiveContainer>
+                        <div data-chart-id={`scatter-${pair.x}-${pair.y}`} className="h-full w-full">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <ScatterChart>
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis type="number" dataKey="x" name={pair.x} />
+                              <YAxis type="number" dataKey="y" name={pair.y} />
+                              <Tooltip cursor={{ strokeDasharray: "3 3" }} />
+                              <Scatter data={pair.points} fill="#0ea5e9" />
+                            </ScatterChart>
+                          </ResponsiveContainer>
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -713,8 +1165,19 @@ function analyzeData(rows: DataRow[]): AnalysisResult {
       }
     }
 
-    const comparableValues = nonNullValues.map((value) => (typeof value === "number" ? value : String(value)));
-    const ordered = detectOrder(comparableValues as Array<string | number>);
+    const comparableValues = nonNullValues.map((value) =>
+      typeof value === "number" ? value : String(value).trim()
+    );
+    const compareFn =
+      dataType === "numérico"
+        ? (a: string | number, b: string | number) => {
+            const aNumber = toNumber(a) ?? 0;
+            const bNumber = toNumber(b) ?? 0;
+            return aNumber - bNumber;
+          }
+        : (a: string | number, b: string | number) =>
+            String(a).localeCompare(String(b), "es", { numeric: true, sensitivity: "base" });
+    const ordered = detectOrder(comparableValues as Array<string | number>, compareFn);
 
     return {
       name: column,
@@ -728,6 +1191,10 @@ function analyzeData(rows: DataRow[]): AnalysisResult {
 
   const numericColumns = columnStats
     .filter((column) => column.dataType === "numérico")
+    .map((column) => column.name);
+
+  const textColumns = columnStats
+    .filter((column) => column.dataType === "texto")
     .map((column) => column.name);
 
   const dateColumns = columns.filter((column) => {
@@ -746,23 +1213,23 @@ function analyzeData(rows: DataRow[]): AnalysisResult {
   const columnsWithNulls = columnStats.filter((column) => column.nullCount > 0).length;
   const totalPositiveValues = columnStats.reduce((sum, column) => sum + column.positiveCount, 0);
 
-  const firstColumn = columns[0];
-  const firstColumnValues = rows
-    .map((row) => row[firstColumn])
-    .filter((value): value is string | number => !isNullValue(value))
-    .map((value) => (typeof value === "number" ? value : String(value)));
-  const orderedByFirstColumn = detectOrder(firstColumnValues) !== "sin orden";
+  const orderedColumns = columnStats
+    .filter((column) => column.ordered !== "sin orden")
+    .map((column) => ({ name: column.name, order: column.ordered }));
 
   return {
     totalRows: rows.length,
     totalColumns: columns.length,
     hasNulls: columnsWithNulls > 0,
-    orderedByFirstColumn,
+    orderedByAnyColumn: orderedColumns.length > 0,
     totalPositiveValues,
     columnsWithNulls,
     columnStats,
     numericColumns,
     dateColumns,
-    rawRows: rows
+    textColumns,
+    rawRows: rows,
+    columns,
+    orderedColumns
   };
 }
