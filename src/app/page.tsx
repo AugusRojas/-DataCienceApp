@@ -10,6 +10,8 @@ import {
   Legend,
   Line,
   LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Scatter,
   ScatterChart,
@@ -39,6 +41,7 @@ type AnalysisResult = {
   columnStats: ColumnStats[];
   numericColumns: string[];
   dateColumns: string[];
+  textColumns: string[];
   rawRows: DataRow[];
   columns: string[];
   orderedColumns: Array<{ name: string; order: ColumnStats["ordered"] }>;
@@ -230,10 +233,14 @@ export default function HomePage() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [sortColumn, setSortColumn] = useState<string | null>(null);
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+  const [histogramColumn, setHistogramColumn] = useState<string | null>(null);
+  const [pieColumn, setPieColumn] = useState<string | null>(null);
 
   useEffect(() => {
     if (analysis) {
       setSortColumn(analysis.columns[0] ?? null);
+      setHistogramColumn(analysis.numericColumns[0] ?? null);
+      setPieColumn(analysis.textColumns[0] ?? null);
     }
   }, [analysis]);
 
@@ -319,6 +326,26 @@ export default function HomePage() {
       return { column, bins: buildHistogram(values) };
     });
   }, [analysis]);
+
+  const pieData = useMemo(() => {
+    if (!analysis || !pieColumn) return [];
+    const counts = new Map<string, number>();
+    analysis.rawRows.forEach((row) => {
+      const value = row[pieColumn];
+      if (isNullValue(value)) {
+        return;
+      }
+      const key = String(value).trim();
+      if (!key) {
+        return;
+      }
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    });
+    return Array.from(counts.entries())
+      .map(([label, value]) => ({ label, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 8);
+  }, [analysis, pieColumn]);
 
   const correlationMatrix = useMemo(() => {
     if (!analysis) return [];
@@ -435,6 +462,68 @@ export default function HomePage() {
     const excelBuffer = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
     const blob = new Blob([excelBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     downloadBlob(blob, `${fileBaseName}-ordenado.xlsx`);
+  };
+
+  const handleDownloadBundle = async () => {
+    if (!analysis || !sortColumn) {
+      setErrorMessage("Selecciona una columna para ordenar antes de descargar el paquete.");
+      return;
+    }
+    if (!histogramColumn || !pieColumn) {
+      setErrorMessage("Selecciona una columna numérica y una columna de texto para los gráficos.");
+      return;
+    }
+    try {
+      const fileBaseName = fileName ? fileName.split(".")[0] : "dataset";
+      const histogramSvg = document.querySelector(
+        `[data-chart-id="hist-${histogramColumn}"] svg`
+      ) as SVGSVGElement | null;
+      const pieSvg = document.querySelector(`[data-chart-id="pie-${pieColumn}"] svg`) as SVGSVGElement | null;
+      if (!histogramSvg || !pieSvg) {
+        throw new Error("No se encontraron los gráficos para incluir en el paquete.");
+      }
+      const histogramImage = await svgToPngDataUrl(histogramSvg);
+      const pieImage = await svgToPngDataUrl(pieSvg);
+      const headers = analysis.columns;
+      const tableRows = sortedRows
+        .map(
+          (row) =>
+            `<tr>${headers
+              .map((header) => `<td>${row[header] ?? ""}</td>`)
+              .join("")}</tr>`
+        )
+        .join("");
+      const htmlContent = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      table { border-collapse: collapse; font-size: 12px; }
+      th, td { border: 1px solid #ccc; padding: 4px 6px; }
+      img { max-width: 600px; }
+    </style>
+  </head>
+  <body>
+    <h3>Dataset ordenado</h3>
+    <table>
+      <thead>
+        <tr>${headers.map((header) => `<th>${header}</th>`).join("")}</tr>
+      </thead>
+      <tbody>
+        ${tableRows}
+      </tbody>
+    </table>
+    <h3>Histograma · ${histogramColumn}</h3>
+    <img src="${histogramImage}" alt="Histograma" />
+    <h3>Gráfico de torta · ${pieColumn}</h3>
+    <img src="${pieImage}" alt="Gráfico de torta" />
+  </body>
+</html>`;
+      const blob = new Blob([htmlContent], { type: "application/vnd.ms-excel" });
+      downloadBlob(blob, `${fileBaseName}-ordenado-con-graficos.xls`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "No se pudo descargar el paquete.");
+    }
   };
 
   const handleChartDownload = async (action: () => Promise<void>) => {
@@ -640,6 +729,43 @@ export default function HomePage() {
                   Descargar Excel
                 </button>
               </div>
+              <div className="mt-4 grid gap-3 rounded-3xl border border-white/60 bg-white/60 p-5 md:grid-cols-[2fr_2fr_1fr]">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Histograma (numérico)</p>
+                  <select
+                    className="mt-2 w-full rounded-full border border-white/80 bg-white/70 px-4 py-2 text-sm"
+                    value={histogramColumn ?? ""}
+                    onChange={(event) => setHistogramColumn(event.target.value)}
+                  >
+                    {analysis.numericColumns.map((column) => (
+                      <option key={column} value={column}>
+                        {column}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-slate-500">Gráfico de torta (texto)</p>
+                  <select
+                    className="mt-2 w-full rounded-full border border-white/80 bg-white/70 px-4 py-2 text-sm"
+                    value={pieColumn ?? ""}
+                    onChange={(event) => setPieColumn(event.target.value)}
+                  >
+                    {analysis.textColumns.map((column) => (
+                      <option key={column} value={column}>
+                        {column}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  className="rounded-full border border-slate-900 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-900 transition hover:bg-slate-900 hover:text-white"
+                  type="button"
+                  onClick={() => void handleDownloadBundle()}
+                >
+                  Descargar paquete
+                </button>
+              </div>
             </section>
 
             <section id="columns" className="mb-10">
@@ -810,6 +936,50 @@ export default function HomePage() {
                       </div>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {analysis.textColumns.length > 0 && pieColumn && (
+                <div className="mt-6 glass rounded-3xl p-5">
+                  <h3 className="text-sm font-semibold">Gráfico de torta · {pieColumn}</h3>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsPng(`pie-${pieColumn}`, `torta-${pieColumn}`))
+                      }
+                    >
+                      PNG
+                    </button>
+                    <button
+                      className="rounded-full border border-slate-900 px-3 py-1 font-semibold text-slate-900 hover:bg-slate-900 hover:text-white"
+                      type="button"
+                      onClick={() =>
+                        void handleChartDownload(() => downloadChartAsExcel(`pie-${pieColumn}`, `torta-${pieColumn}`))
+                      }
+                    >
+                      Excel
+                    </button>
+                  </div>
+                  <div className="mt-4 h-64">
+                    <div data-chart-id={`pie-${pieColumn}`} className="h-full w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <PieChart>
+                          <Tooltip />
+                          <Legend />
+                          <Pie
+                            data={pieData}
+                            dataKey="value"
+                            nameKey="label"
+                            outerRadius={90}
+                            fill="#f97316"
+                            label
+                          />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -1023,6 +1193,10 @@ function analyzeData(rows: DataRow[]): AnalysisResult {
     .filter((column) => column.dataType === "numérico")
     .map((column) => column.name);
 
+  const textColumns = columnStats
+    .filter((column) => column.dataType === "texto")
+    .map((column) => column.name);
+
   const dateColumns = columns.filter((column) => {
     const nonNullValues = rows
       .map((row) => row[column])
@@ -1053,6 +1227,7 @@ function analyzeData(rows: DataRow[]): AnalysisResult {
     columnStats,
     numericColumns,
     dateColumns,
+    textColumns,
     rawRows: rows,
     columns,
     orderedColumns
